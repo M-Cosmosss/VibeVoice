@@ -6,7 +6,7 @@
 
 - **基础镜像**：`vllm/vllm-openai:v0.14.1`，安装 VibeVoice plugin。
 - **模型权重**：使用 RunPod Serverless **Model cache**，worker 从 `/runpod-volume/huggingface-cache/hub` 解析本地 snapshot，不把 14GB 权重烤进镜像。
-- **服务端做端到端编排**：单次请求内完成音频下载、切片、并发 ASR、文稿合并，结果同时写入 `/tmp/transcripts/{job_id}.{json,txt}` 并在响应里返回（worker 销毁后丢失，但 API 已经把完整文稿返回了）。
+- **服务端做端到端编排**：单次请求完成下载、切片、并发 ASR、合并。结果写入 `/tmp/transcripts/{job_id}.{json,txt}` 并直接在 API 返回。
 - **日志**：每阶段输出 `[TIMING] stage=... duration_s=...` 结构化日志，便于切换 GPU benchmark。
 
 ### 镜像分层（按变更频率排序，最大化 cache 命中）
@@ -20,7 +20,7 @@ Layer 5: 生成 tokenizer patch 文件         （随 plugin 变，小层）
 Layer 6: runpod/*.py 业务代码              （日常迭代只改这层）
 ```
 
-日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建最后一层（~10 KB）。模型由 RunPod 的 Model cache 预热，不随镜像拉取。
+日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建最后一层（~10 KB）。
 
 ## 2. 构建镜像
 
@@ -45,16 +45,16 @@ docker buildx build \
   --push .
 ```
 
-首次构建 ≈ 15–25 min（多了 14 GB 模型下载层），增量构建几分钟。
+首次构建通常 15–25 分钟，增量构建通常几分钟。
 
 ## 3. RunPod Endpoint 配置
 
-- **GPU**：L40S 48 GB（任意区域都可，因为模型烤在镜像里没区域绑定）
+- **GPU**：L40S 48 GB（推荐起步）
 - **Active Workers**：`0`（scale-to-zero）
 - **Max Workers**：按客户端最大并发上限设（默认建议 4）
 - **Idle Timeout**：5–10s
 - **FlashBoot**：ON
-- **Container Disk**：20–30 GB（镜像不再包含 ASR 权重，仍需容纳 vLLM/CUDA 基础层）
+- **Container Disk**：20–30 GB
 - **Network Volume**：**不需要**
 - **Model**：`microsoft/VibeVoice-ASR`（必须填写，用于启用 RunPod Model cache）
 - **Execution Timeout**：根据最长音频估，参考下面的耗时表
@@ -72,6 +72,7 @@ docker buildx build \
 | `MODEL_PATH` | `/tmp/vibevoice-asr-runtime` | 启动时创建的 runtime 模型目录，权重为 symlink，tokenizer 为镜像内 patch |
 | `DEFAULT_CHUNK_MINUTES` | `30` | 切片长度（分钟） |
 | `DEFAULT_CONCURRENCY` | `4` | 单请求内并发切片数 |
+| `ASR_PROMPT_TOKEN_RESERVE` | `512` | 为 system/user prompt 预留的输入 token 预算；输出 token 自动使用 `MAX_MODEL_LEN` 剩余空间 |
 | `VLLM_READY_TIMEOUT_S` | `300` | 等待 vLLM 就绪超时 |
 | `ASR_REQUEST_TIMEOUT_S` | `1800` | 单切片 ASR HTTP 超时 |
 | `TRANSCRIPT_DIR` | `/tmp/transcripts` | 文稿落盘目录 |
@@ -130,6 +131,14 @@ docker buildx build \
     "num_chunks": 2,
     "chunk_seconds": 1800,
     "concurrency": 4,
+    "download_s": 4.21,
+    "probe_s": 0.08,
+    "split_s": 1.10,
+    "merge_s": 0.05,
+    "asr_wall_s": 87.30,
+    "prepare_per_chunk_s": [0.62, 0.64],
+    "prepare_total_s": 1.26,
+    "prepare_max_s": 0.64,
     "asr_per_chunk_s": [42.13, 45.22],
     "asr_total_s": 87.35,
     "asr_max_s": 45.22,
@@ -138,7 +147,7 @@ docker buildx build \
 }
 ```
 
-> 注意：`files` 路径在 worker 容器内部，worker 销毁后丢失。如果要保留文稿历史请把 `text` / `segments` 入你自己的存储（S3/OSS/DB）。
+> 注意：`files` 路径在 worker 容器内，worker 销毁后会丢失。要保留历史请把 `text` / `segments` 写入你自己的存储（S3/OSS/DB）。
 
 ### 4.4 同步调用示例
 
@@ -178,14 +187,14 @@ done
 [TIMING] stage=split job=abc123 duration_s=1.103 num_chunks=2 chunk_seconds=1800
 [TIMING] stage=asr_chunk_start job=abc123 chunk=0 start=0 end=1800
 [TIMING] stage=asr_chunk_start job=abc123 chunk=1 start=1800 end=3600
-[TIMING] stage=asr_chunk_done job=abc123 chunk=0 duration_s=42.131 chunk_audio_s=1800.0 rtf=0.023 segments=180 parse_ok=1
-[TIMING] stage=asr_chunk_done job=abc123 chunk=1 duration_s=45.221 chunk_audio_s=1800.0 rtf=0.025 segments=192 parse_ok=1
+[TIMING] stage=asr_chunk_done job=abc123 chunk=0 duration_s=42.131 prepare_s=0.620 chunk_audio_s=1800.0 rtf=0.023 segments=180 parse_ok=1
+[TIMING] stage=asr_chunk_done job=abc123 chunk=1 duration_s=45.221 prepare_s=0.640 chunk_audio_s=1800.0 rtf=0.025 segments=192 parse_ok=1
 [TIMING] stage=asr_total job=abc123 duration_s=87.302 concurrency=4 num_chunks=2
 [TIMING] stage=merge job=abc123 duration_s=0.054 segments=372 chars=12453
 [TIMING] stage=job_done job=abc123 total_s=92.702 audio_s=3600.0 rtf=0.0258 gpu=NVIDIA L40S num_chunks=2 concurrency=4
 ```
 
-切换 GPU 后只需对比 `stage=job_done` 行的 `rtf`、`asr_max_s`、`asr_per_chunk_s` 即可。
+切换 GPU 后重点对比 `stage=job_done` 的 `rtf`，以及响应里的 `asr_max_s`、`asr_per_chunk_s`。
 
 ## 6. 调参建议
 

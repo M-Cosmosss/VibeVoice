@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import subprocess
@@ -22,6 +23,10 @@ from runpod_app.timing import emit, gpu_name, timed
 VLLM_URL = f"http://127.0.0.1:{os.environ.get('VLLM_PORT', '8000')}/v1/chat/completions"
 TRANSCRIPT_DIR = Path(os.environ.get("TRANSCRIPT_DIR", "/tmp/transcripts"))
 ASR_REQUEST_TIMEOUT_S = float(os.environ.get("ASR_REQUEST_TIMEOUT_S", "1800"))
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768"))
+ASR_PROMPT_TOKEN_RESERVE = int(os.environ.get("ASR_PROMPT_TOKEN_RESERVE", "512"))
+ASR_AUDIO_SAMPLE_RATE = 24000
+ASR_AUDIO_TOKEN_COMPRESS_RATIO = 3200
 
 
 SHOW_KEYS = ["Start time", "End time", "Speaker ID", "Content"]
@@ -40,6 +45,7 @@ class ChunkResult:
     raw_content: str
     segments: list[dict[str, Any]] = field(default_factory=list)
     parse_ok: bool = False
+    prepare_duration_s: float = 0.0
     asr_duration_s: float = 0.0
 
 
@@ -99,6 +105,24 @@ def split_audio(src: Path, chunk_seconds: int, work_dir: Path, *, job_id: str,
 
 # ---------- ASR ----------
 
+def _estimate_audio_tokens(duration_s: float) -> int:
+    # Mirrors vllm_plugin.model.get_mm_max_tokens_per_item().
+    samples = max(0, duration_s) * ASR_AUDIO_SAMPLE_RATE
+    return int(math.ceil(samples / ASR_AUDIO_TOKEN_COMPRESS_RATIO)) + 3
+
+
+def _max_tokens_for_duration(duration_s: float) -> int:
+    input_budget = _estimate_audio_tokens(duration_s) + ASR_PROMPT_TOKEN_RESERVE
+    room = MAX_MODEL_LEN - input_budget
+    if room < 1:
+        raise ValueError(
+            f"chunk duration {duration_s:.2f}s leaves no output token budget "
+            f"under MAX_MODEL_LEN={MAX_MODEL_LEN}; reduce chunk_minutes or "
+            "increase MAX_MODEL_LEN"
+        )
+    return room
+
+
 def _build_payload(audio_b64: str, mime: str, duration_s: float,
                    hotwords: str | None) -> dict[str, Any]:
     if hotwords and hotwords.strip():
@@ -122,7 +146,7 @@ def _build_payload(audio_b64: str, mime: str, duration_s: float,
                 {"type": "text", "text": prompt},
             ]},
         ],
-        "max_tokens": 32768,
+        "max_tokens": _max_tokens_for_duration(duration_s),
         "temperature": 0.0,
         "top_p": 1.0,
         "stream": False,
@@ -134,24 +158,36 @@ async def asr_chunk(client: httpx.AsyncClient, idx: int, start_s: float,
                     *, job_id: str) -> ChunkResult:
     duration = end_s - start_s
     mime = "audio/mpeg"
+    prepare_t0 = time.perf_counter()
     audio_b64 = base64.b64encode(path.read_bytes()).decode()
     payload = _build_payload(audio_b64, mime, duration, hotwords)
+    prepare_dt = time.perf_counter() - prepare_t0
 
     emit("asr_chunk_start", job_id=job_id, chunk=idx, start=start_s, end=end_s)
     t0 = time.perf_counter()
     resp = await client.post(VLLM_URL, json=payload, timeout=ASR_REQUEST_TIMEOUT_S)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        body = _truncate(resp.text.replace("\n", "\\n"), 1000)
+        emit("asr_chunk_error", job_id=job_id, chunk=idx,
+             status_code=resp.status_code, response_body=body)
+        raise RuntimeError(
+            f"ASR request failed with HTTP {resp.status_code}: {body}"
+        ) from e
     dt = time.perf_counter() - t0
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
 
     segments, parse_ok = _parse_segments(content, offset_s=start_s)
     emit("asr_chunk_done", job_id=job_id, chunk=idx, duration_s=dt,
+         prepare_s=prepare_dt,
          chunk_audio_s=duration, rtf=dt / max(duration, 1e-6),
          segments=len(segments), parse_ok=int(parse_ok))
     return ChunkResult(
         index=idx, start_s=start_s, end_s=end_s, duration_s=duration,
         raw_content=content, segments=segments, parse_ok=parse_ok,
+        prepare_duration_s=prepare_dt,
         asr_duration_s=dt,
     )
 
@@ -300,20 +336,31 @@ async def run_job(audio_url: str, *, hotwords: str | None,
 
     with tempfile.TemporaryDirectory(prefix=f"vv_{job_id}_") as tmp:
         work = Path(tmp)
+        t_stage = time.perf_counter()
         audio_path = await download_audio(audio_url, work, job_id=job_id)
+        download_s = time.perf_counter() - t_stage
 
+        t_stage = time.perf_counter()
         with timed("probe", job_id=job_id) as rec:
             duration_s = probe_duration_s(audio_path)
             rec["audio_duration_s"] = round(duration_s, 2)
+        probe_s = time.perf_counter() - t_stage
 
+        t_stage = time.perf_counter()
         chunks = split_audio(audio_path, chunk_seconds, work,
                              job_id=job_id, duration_s=duration_s)
-        results = await run_chunks(chunks, hotwords, concurrency, job_id=job_id)
+        split_s = time.perf_counter() - t_stage
 
+        t_stage = time.perf_counter()
+        results = await run_chunks(chunks, hotwords, concurrency, job_id=job_id)
+        asr_wall_s = time.perf_counter() - t_stage
+
+        t_stage = time.perf_counter()
         with timed("merge", job_id=job_id) as rec:
             text, segments = merge_results(results)
             rec["segments"] = len(segments)
             rec["chars"] = len(text)
+        merge_s = time.perf_counter() - t_stage
 
     json_path = TRANSCRIPT_DIR / f"{job_id}.json"
     txt_path = TRANSCRIPT_DIR / f"{job_id}.txt"
@@ -325,6 +372,14 @@ async def run_job(audio_url: str, *, hotwords: str | None,
         "num_chunks": len(chunks),
         "chunk_seconds": chunk_seconds,
         "concurrency": concurrency,
+        "download_s": round(download_s, 3),
+        "probe_s": round(probe_s, 3),
+        "split_s": round(split_s, 3),
+        "merge_s": round(merge_s, 3),
+        "asr_wall_s": round(asr_wall_s, 3),
+        "prepare_per_chunk_s": [round(r.prepare_duration_s, 3) for r in results],
+        "prepare_total_s": round(sum(r.prepare_duration_s for r in results), 3),
+        "prepare_max_s": round(max((r.prepare_duration_s for r in results), default=0.0), 3),
         "asr_per_chunk_s": [round(r.asr_duration_s, 3) for r in results],
         "asr_total_s": round(sum(r.asr_duration_s for r in results), 3),
         "asr_max_s": round(max((r.asr_duration_s for r in results), default=0.0), 3),
