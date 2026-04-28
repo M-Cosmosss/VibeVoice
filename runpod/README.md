@@ -5,69 +5,95 @@
 ## 1. 架构
 
 - **基础镜像**：`vllm/vllm-openai:v0.14.1`，安装 VibeVoice plugin。
-- **模型权重**：放 RunPod Network Volume（`/runpod-volume/hf`），首次冷启动自动下载（~14 GB），后续冷启动直接读盘。
-- **服务端做端到端编排**：单次请求内完成音频下载、切片、并发 ASR、文稿合并，结果同时写入 `/runpod-volume/transcripts/{job_id}.{json,txt}` 并在响应里返回。
+- **模型权重**：**烤进镜像**（`/opt/vibevoice-asr`），不依赖 Network Volume，**不锁区域**，方便随时切换 GPU benchmark。
+- **服务端做端到端编排**：单次请求内完成音频下载、切片、并发 ASR、文稿合并，结果同时写入 `/tmp/transcripts/{job_id}.{json,txt}` 并在响应里返回（worker 销毁后丢失，但 API 已经把完整文稿返回了）。
 - **日志**：每阶段输出 `[TIMING] stage=... duration_s=...` 结构化日志，便于切换 GPU benchmark。
+
+### 镜像分层（按变更频率排序，最大化 cache 命中）
+
+```
+Layer 1: apt deps                         （几乎不变）
+Layer 2: hf-transfer pip install          （几乎不变）
+Layer 3: 14 GB 模型权重 snapshot_download  （只在 MODEL_ID 变更时重下）
+Layer 4: vibevoice / vllm_plugin 源码      （改动 vibevoice 时变）
+Layer 5: pip install /app[vllm]           （依赖改动时变）
+Layer 6: 生成 tokenizer 文件               （随 plugin 变）
+Layer 7: runpod/*.py 业务代码              （日常迭代只改这层）
+```
+
+日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建 Layer 7（~10 KB），不重下模型。
 
 ## 2. 构建镜像
 
-镜像必须从仓库根目录构建（Dockerfile 引用了 `vibevoice/`、`vllm_plugin/`、`pyproject.toml`、`runpod/`）：
+### 2.1 推荐：RunPod GitHub 集成（云端 builder，零本地流量）
+
+- RunPod 控制台 → **Serverless** → **New Endpoint** → **GitHub** 来源
+- Repo: `M-Cosmosss/VibeVoice`
+- Branch: `main`
+- Dockerfile path: `runpod/Dockerfile`
+- Build context: `/`（仓库根目录）
+- 后续 `git push` 自动重新构建 + 滚动更新
+
+### 2.2 备选：本地构建（需要跨架构 + push）
 
 ```bash
 cd /path/to/VibeVoice
-docker build -f runpod/Dockerfile -t <your-registry>/vibevoice-asr-runpod:latest .
-docker push <your-registry>/vibevoice-asr-runpod:latest
+docker buildx create --name xbuild --use --bootstrap
+docker buildx build \
+  --platform linux/amd64 \
+  -f runpod/Dockerfile \
+  -t <your-registry>/vibevoice-asr-runpod:latest \
+  --push .
 ```
+
+首次构建 ≈ 15–25 min（多了 14 GB 模型下载层），增量构建几分钟。
 
 ## 3. RunPod Endpoint 配置
 
-### 3.1 创建 Network Volume
-
-- Storage → Network Volumes → New Volume
-- 大小：≥ 30 GB（模型 ~14 GB + 文稿空间）
-- 区域：选你打算跑的 GPU 区域（必须同区域）
-
-### 3.2 创建 Serverless Endpoint
-
-- New Endpoint → Custom
-- **Container Image**：`<your-registry>/vibevoice-asr-runpod:latest`
-- **GPU**：L40S 48GB（推荐）
-- **Active Workers**：`0`（真正 scale-to-zero）
+- **GPU**：L40S 48 GB（任意区域都可，因为模型烤在镜像里没区域绑定）
+- **Active Workers**：`0`（scale-to-zero）
 - **Max Workers**：按客户端最大并发上限设（默认建议 4）
 - **Idle Timeout**：5–10s
 - **FlashBoot**：ON
-- **Container Disk**：20 GB
-- **Network Volume**：挂载到 `/runpod-volume`（路径必须一致）
-- **Container Start Command**：留空（用 ENTRYPOINT）
-- **环境变量**（可选覆盖默认值）：
+- **Container Disk**：30 GB（容纳 ~24 GB 镜像 + 解压临时空间）
+- **Network Volume**：**不需要**
+- **Execution Timeout**：根据最长音频估，参考下面的耗时表
+- **Allow GPU fallback**：可选开（L40S 紧张时自动升档到 A100/H100，按使用计费）
+
+### 环境变量（可选覆盖）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MODEL_ID` | `microsoft/VibeVoice-ASR` | HF 模型 id |
 | `MAX_MODEL_LEN` | `32768` | vLLM 上下文长度（30min 切片够用） |
 | `MAX_NUM_SEQS` | `8` | vLLM 单 worker batch 上限 |
 | `GPU_MEMORY_UTILIZATION` | `0.9` | vLLM 显存占比 |
 | `DEFAULT_CHUNK_MINUTES` | `30` | 切片长度（分钟） |
 | `DEFAULT_CONCURRENCY` | `4` | 单请求内并发切片数 |
-| `VLLM_READY_TIMEOUT_S` | `900` | 等待 vLLM 就绪超时 |
+| `VLLM_READY_TIMEOUT_S` | `300` | 等待 vLLM 就绪超时 |
 | `ASR_REQUEST_TIMEOUT_S` | `1800` | 单切片 ASR HTTP 超时 |
-
-### 3.3 首次冷启动
-
-- 第一个请求会触发权重下载（HF Hub → Network Volume），耗时约 5–15 分钟（取决于区域带宽）。
-- 下载用 `flock` 单飞，多 worker 同时拉起也只会下载一次。
-- 完成后写入 `/runpod-volume/hf/.vibevoice-prep.done`，后续 worker 直接跳过。
-- 想避免首请求慢，可手动起一个临时 Pod 挂同一个 Network Volume，跑：
-
-```bash
-HF_HOME=/runpod-volume/hf python3 -c "from huggingface_hub import snapshot_download; snapshot_download('microsoft/VibeVoice-ASR')"
-python3 -m vllm_plugin.tools.generate_tokenizer_files --output $(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('microsoft/VibeVoice-ASR'))")
-echo "$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('microsoft/VibeVoice-ASR'))")" > /runpod-volume/hf/.vibevoice-prep.done
-```
+| `TRANSCRIPT_DIR` | `/tmp/transcripts` | 文稿落盘目录 |
 
 ## 4. 调用
 
-### 4.1 输入
+### 4.1 同步 vs 异步
+
+| 端点 | 何时用 | 上限 |
+|---|---|---|
+| `POST /v2/<EID>/runsync` | 估算总耗时 < ~280s 的请求（≤ 4h 音频在 L40S 上够用） | 默认 **300s** |
+| `POST /v2/<EID>/run` + 轮询 `/status/{id}` | 长音频或不确定时长 | worker execution timeout，可配几小时 |
+
+按 L40S + concurrency=4 估算：
+
+| 音频时长 | 切片数 | 预估总耗时 | 推荐 |
+|---|---|---|---|
+| 30 min | 1 | ~45 s | runsync |
+| 1 h | 2 | ~50 s | runsync |
+| 2 h | 4 | ~50 s | runsync |
+| 4 h | 8 | ~100 s | runsync |
+| 8 h | 16 | ~200 s | runsync 边缘，建议 run+poll |
+| 16 h+ | 32+ | 400 s+ | run+poll |
+
+### 4.2 输入
 
 ```json
 {
@@ -81,7 +107,7 @@ echo "$(python3 -c "from huggingface_hub import snapshot_download; print(snapsho
 }
 ```
 
-### 4.2 输出
+### 4.3 输出
 
 ```json
 {
@@ -91,8 +117,8 @@ echo "$(python3 -c "from huggingface_hub import snapshot_download; print(snapsho
     {"start": 0.12, "end": 3.45, "speaker": "1", "text": "..."}
   ],
   "files": {
-    "json": "/runpod-volume/transcripts/abc123.json",
-    "txt":  "/runpod-volume/transcripts/abc123.txt"
+    "json": "/tmp/transcripts/abc123.json",
+    "txt":  "/tmp/transcripts/abc123.txt"
   },
   "timing": {
     "total_s": 92.7,
@@ -109,7 +135,9 @@ echo "$(python3 -c "from huggingface_hub import snapshot_download; print(snapsho
 }
 ```
 
-### 4.3 调用示例（curl）
+> 注意：`files` 路径在 worker 容器内部，worker 销毁后丢失。如果要保留文稿历史请把 `text` / `segments` 入你自己的存储（S3/OSS/DB）。
+
+### 4.4 同步调用示例
 
 ```bash
 curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
@@ -118,22 +146,37 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
   -d '{"input": {"audio_url": "https://.../foo.mp3", "concurrency": 4}}'
 ```
 
-> 长音频建议用 `/run`（异步）+ `/status/{id}` 轮询；`/runsync` 有 ~5 min 上限。
+### 4.5 异步调用示例
+
+```bash
+# 1. 提交
+JOB=$(curl -s -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/run" \
+  -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"audio_url": "https://.../long.mp3"}}' | jq -r .id)
+
+# 2. 轮询
+while true; do
+  STATUS=$(curl -s "https://api.runpod.ai/v2/<ENDPOINT_ID>/status/$JOB" \
+    -H "Authorization: Bearer $RUNPOD_API_KEY")
+  echo "$STATUS" | jq .status
+  [[ $(echo "$STATUS" | jq -r .status) == "COMPLETED" ]] && echo "$STATUS" | jq .output && break
+  sleep 5
+done
+```
 
 ## 5. 日志（benchmark 友好）
 
-每个阶段都会打 `[TIMING]` 行，可直接 grep 出来分析：
-
 ```
-[TIMING] stage=vllm_ready duration_s=18.231
+[TIMING] stage=vllm_ready duration_s=18
 [TIMING] stage=job_start job=abc123 chunk_minutes=30 concurrency=4 gpu=NVIDIA L40S
 [TIMING] stage=download job=abc123 url=https://... duration_s=4.210 size_mb=58.30
 [TIMING] stage=probe job=abc123 duration_s=0.082 audio_duration_s=3600.00
 [TIMING] stage=split job=abc123 duration_s=1.103 num_chunks=2 chunk_seconds=1800
 [TIMING] stage=asr_chunk_start job=abc123 chunk=0 start=0 end=1800
 [TIMING] stage=asr_chunk_start job=abc123 chunk=1 start=1800 end=3600
-[TIMING] stage=asr_chunk_done job=abc123 chunk=0 duration_s=42.131 chunk_audio_s=1800.0 rtf=0.0234 segments=180 parse_ok=1
-[TIMING] stage=asr_chunk_done job=abc123 chunk=1 duration_s=45.221 chunk_audio_s=1800.0 rtf=0.0251 segments=192 parse_ok=1
+[TIMING] stage=asr_chunk_done job=abc123 chunk=0 duration_s=42.131 chunk_audio_s=1800.0 rtf=0.023 segments=180 parse_ok=1
+[TIMING] stage=asr_chunk_done job=abc123 chunk=1 duration_s=45.221 chunk_audio_s=1800.0 rtf=0.025 segments=192 parse_ok=1
 [TIMING] stage=asr_total job=abc123 duration_s=87.302 concurrency=4 num_chunks=2
 [TIMING] stage=merge job=abc123 duration_s=0.054 segments=372 chars=12453
 [TIMING] stage=job_done job=abc123 total_s=92.702 audio_s=3600.0 rtf=0.0258 gpu=NVIDIA L40S num_chunks=2 concurrency=4
@@ -146,4 +189,4 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
 - **真正决定吞吐的是 `asr_max_s`**（并发下最慢那片），不是 `asr_total_s`。
 - 想降单切片延迟：增大 `MAX_NUM_SEQS`（更高显存占用） / 缩短 `chunk_minutes`（切更多片，并发分担）。
 - 想降总成本：保持 `concurrency` ≤ Max Workers，避免排队。
-- L40S 48GB 建议起步：`MAX_MODEL_LEN=32768 MAX_NUM_SEQS=8 chunk_minutes=30 concurrency=4`。
+- L40S 48 GB 起步：`MAX_MODEL_LEN=32768 MAX_NUM_SEQS=8 chunk_minutes=30 concurrency=4`。

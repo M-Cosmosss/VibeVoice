@@ -20,7 +20,7 @@ from runpod_app.timing import emit, gpu_name, timed
 
 
 VLLM_URL = f"http://127.0.0.1:{os.environ.get('VLLM_PORT', '8000')}/v1/chat/completions"
-TRANSCRIPT_DIR = Path(os.environ.get("TRANSCRIPT_DIR", "/runpod-volume/transcripts"))
+TRANSCRIPT_DIR = Path(os.environ.get("TRANSCRIPT_DIR", "/tmp/transcripts"))
 ASR_REQUEST_TIMEOUT_S = float(os.environ.get("ASR_REQUEST_TIMEOUT_S", "1800"))
 
 
