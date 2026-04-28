@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 import traceback
 from typing import Any
 
@@ -65,7 +66,30 @@ async def _handle(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def handler(event: dict[str, Any]) -> dict[str, Any]:
-    return asyncio.run(_handle(event))
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_handle(event))
+
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
+
+    def run_in_thread() -> None:
+        nonlocal result, error
+        try:
+            result = asyncio.run(_handle(event))
+        except BaseException as e:
+            error = e
+
+    thread = threading.Thread(target=run_in_thread, daemon=True)
+    thread.start()
+    thread.join()
+
+    if error is not None:
+        raise error
+    if result is None:
+        raise RuntimeError("handler completed without a result")
+    return result
 
 
 if __name__ == "__main__":
