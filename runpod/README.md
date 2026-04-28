@@ -4,7 +4,7 @@
 
 ## 1. 架构
 
-- **基础镜像**：`vllm/vllm-openai:v0.14.1`，安装 VibeVoice plugin。
+- **基础镜像**：`runpod/worker-v1-vllm:v2.13.0`，复用 RunPod 官方 vLLM worker 大层，减少 Serverless 冷启动拉镜像时间；旧版 `vllm/vllm-openai:v0.14.1` Dockerfile 备份在 `runpod/Dockerfile.vllm-openai-backup`。
 - **模型权重**：使用 RunPod Serverless **Model cache**，worker 从 `/runpod-volume/huggingface-cache/hub` 解析本地 snapshot，不把 14GB 权重烤进镜像。
 - **服务端做端到端编排**：单次请求完成下载、切片、并发 ASR、合并。结果写入 `/tmp/transcripts/{job_id}.{json,txt}` 并直接在 API 返回。
 - **日志**：每阶段输出 `[TIMING] stage=... duration_s=...` 结构化日志，便于切换 GPU benchmark。
@@ -12,15 +12,14 @@
 ### 镜像分层（按变更频率排序，最大化 cache 命中）
 
 ```
-Layer 1: apt deps                         （几乎不变）
-Layer 2: hf-transfer pip install          （几乎不变）
-Layer 3: vibevoice / vllm_plugin 源码      （改动 vibevoice 时变）
-Layer 4: pip install /app[vllm]           （依赖改动时变）
-Layer 5: 生成 tokenizer patch 文件         （随 plugin 变，小层）
-Layer 6: runpod/*.py 业务代码              （日常迭代只改这层）
+Layer 1: runpod/worker-v1-vllm 官方基础镜像（RunPod 节点更可能命中缓存）
+Layer 2: ffmpeg/libsndfile/curl            （小层）
+Layer 3: vibevoice / vllm_plugin 源码       （--no-deps 安装，不重装 vLLM/PyTorch）
+Layer 4: 生成 tokenizer patch 文件          （随 plugin 变，小层）
+Layer 5: runpod/*.py 业务代码               （日常迭代只改这层）
 ```
 
-日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建最后一层（~10 KB）。
+日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建最后一层（~10 KB）。仓库根目录 `.dockerignore` 会排除 docs、demo、tests、训练数据和本地输出，减少 GitHub builder 的 build context。
 
 ## 2. 构建镜像
 
