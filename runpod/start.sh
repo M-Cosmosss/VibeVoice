@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Entry: launch vLLM in background, then run RunPod handler.
-# Model weights are baked into the image at $MODEL_PATH.
+# Model weights are provided by RunPod's Hugging Face model cache.
 set -euo pipefail
 
 log() { echo "[start] $*"; }
 
-: "${MODEL_PATH:=/opt/vibevoice-asr}"
+: "${MODEL_ID:=${MODEL_NAME:-microsoft/VibeVoice-ASR}}"
+: "${MODEL_REVISION:=}"
+: "${HF_CACHE_ROOT:=/runpod-volume/huggingface-cache/hub}"
+: "${TOKENIZER_PATCH_DIR:=/opt/vibevoice-tokenizer}"
+: "${MODEL_PATH:=/tmp/vibevoice-asr-runtime}"
 : "${VLLM_PORT:=8000}"
 : "${TRANSCRIPT_DIR:=/tmp/transcripts}"
 : "${MAX_MODEL_LEN:=32768}"
@@ -15,11 +19,92 @@ log() { echo "[start] $*"; }
 
 mkdir -p "$TRANSCRIPT_DIR"
 
-if [[ ! -f "$MODEL_PATH/config.json" ]]; then
-    log "ERROR: model not found at $MODEL_PATH (config.json missing). Image is broken."
+CACHED_MODEL_PATH=$(
+    python3 - <<'PY'
+import os
+import sys
+
+model_id = os.environ["MODEL_ID"]
+revision = os.environ.get("MODEL_REVISION", "").strip()
+cache_root = os.environ["HF_CACHE_ROOT"]
+
+if "/" not in model_id:
+    raise SystemExit(f"MODEL_ID must be in org/name format, got: {model_id!r}")
+
+org, name = model_id.split("/", 1)
+expected_roots = [
+    os.path.join(cache_root, f"models--{org}--{name}"),
+    os.path.join(cache_root, f"models--{org.lower()}--{name.lower()}"),
+]
+
+model_root = next((p for p in expected_roots if os.path.isdir(p)), None)
+if model_root is None and os.path.isdir(cache_root):
+    wanted = f"models--{org}--{name}".lower()
+    for entry in os.listdir(cache_root):
+        if entry.lower() == wanted:
+            model_root = os.path.join(cache_root, entry)
+            break
+
+if model_root is None:
+    raise SystemExit(
+        "RunPod cached model not found. Configure the endpoint Model field as "
+        f"{model_id!r}; looked under {cache_root!r}."
+    )
+
+snapshots_dir = os.path.join(model_root, "snapshots")
+candidates = []
+if revision:
+    candidates.append(os.path.join(snapshots_dir, revision))
+
+refs_main = os.path.join(model_root, "refs", "main")
+if os.path.isfile(refs_main):
+    with open(refs_main, "r", encoding="utf-8") as f:
+        ref = f.read().strip()
+    if ref:
+        candidates.append(os.path.join(snapshots_dir, ref))
+
+if os.path.isdir(snapshots_dir):
+    candidates.extend(
+        os.path.join(snapshots_dir, d)
+        for d in sorted(os.listdir(snapshots_dir))
+        if os.path.isdir(os.path.join(snapshots_dir, d))
+    )
+
+for candidate in candidates:
+    if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "config.json")):
+        print(candidate)
+        break
+else:
+    raise SystemExit(f"No cached snapshot with config.json found under {snapshots_dir!r}.")
+PY
+)
+
+log "cached model path=${CACHED_MODEL_PATH}"
+log "preparing runtime model path=${MODEL_PATH}"
+rm -rf "$MODEL_PATH"
+mkdir -p "$MODEL_PATH"
+shopt -s dotglob nullglob
+for item in "$CACHED_MODEL_PATH"/*; do
+    ln -s "$item" "$MODEL_PATH/$(basename "$item")"
+done
+shopt -u dotglob nullglob
+
+if [[ ! -d "$TOKENIZER_PATCH_DIR" ]]; then
+    log "ERROR: tokenizer patch directory not found at $TOKENIZER_PATCH_DIR"
     exit 1
 fi
-log "MODEL_PATH=$MODEL_PATH (baked-in)"
+for file in vocab.json merges.txt tokenizer.json tokenizer_config.json added_tokens.json special_tokens_map.json; do
+    rm -f "$MODEL_PATH/$file"
+done
+cp -f "$TOKENIZER_PATCH_DIR"/* "$MODEL_PATH"/
+
+if [[ ! -f "$MODEL_PATH/config.json" ]]; then
+    log "ERROR: model not found at $MODEL_PATH (config.json missing)."
+    exit 1
+fi
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+log "MODEL_PATH=$MODEL_PATH (RunPod cached model + tokenizer overlay)"
 
 log "launching vLLM serve on port ${VLLM_PORT} (max_model_len=${MAX_MODEL_LEN}, max_num_seqs=${MAX_NUM_SEQS})"
 VLLM_T0=$(date +%s)

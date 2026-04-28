@@ -5,7 +5,7 @@
 ## 1. 架构
 
 - **基础镜像**：`vllm/vllm-openai:v0.14.1`，安装 VibeVoice plugin。
-- **模型权重**：**烤进镜像**（`/opt/vibevoice-asr`），不依赖 Network Volume，**不锁区域**，方便随时切换 GPU benchmark。
+- **模型权重**：使用 RunPod Serverless **Model cache**，worker 从 `/runpod-volume/huggingface-cache/hub` 解析本地 snapshot，不把 14GB 权重烤进镜像。
 - **服务端做端到端编排**：单次请求内完成音频下载、切片、并发 ASR、文稿合并，结果同时写入 `/tmp/transcripts/{job_id}.{json,txt}` 并在响应里返回（worker 销毁后丢失，但 API 已经把完整文稿返回了）。
 - **日志**：每阶段输出 `[TIMING] stage=... duration_s=...` 结构化日志，便于切换 GPU benchmark。
 
@@ -14,14 +14,13 @@
 ```
 Layer 1: apt deps                         （几乎不变）
 Layer 2: hf-transfer pip install          （几乎不变）
-Layer 3: 14 GB 模型权重 snapshot_download  （只在 MODEL_ID 变更时重下）
-Layer 4: vibevoice / vllm_plugin 源码      （改动 vibevoice 时变）
-Layer 5: pip install /app[vllm]           （依赖改动时变）
-Layer 6: 生成 tokenizer 文件               （随 plugin 变）
-Layer 7: runpod/*.py 业务代码              （日常迭代只改这层）
+Layer 3: vibevoice / vllm_plugin 源码      （改动 vibevoice 时变）
+Layer 4: pip install /app[vllm]           （依赖改动时变）
+Layer 5: 生成 tokenizer patch 文件         （随 plugin 变，小层）
+Layer 6: runpod/*.py 业务代码              （日常迭代只改这层）
 ```
 
-日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建 Layer 7（~10 KB），不重下模型。
+日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建最后一层（~10 KB）。模型由 RunPod 的 Model cache 预热，不随镜像拉取。
 
 ## 2. 构建镜像
 
@@ -55,8 +54,9 @@ docker buildx build \
 - **Max Workers**：按客户端最大并发上限设（默认建议 4）
 - **Idle Timeout**：5–10s
 - **FlashBoot**：ON
-- **Container Disk**：30 GB（容纳 ~24 GB 镜像 + 解压临时空间）
+- **Container Disk**：20–30 GB（镜像不再包含 ASR 权重，仍需容纳 vLLM/CUDA 基础层）
 - **Network Volume**：**不需要**
+- **Model**：`microsoft/VibeVoice-ASR`（必须填写，用于启用 RunPod Model cache）
 - **Execution Timeout**：根据最长音频估，参考下面的耗时表
 - **Allow GPU fallback**：可选开（L40S 紧张时自动升档到 A100/H100，按使用计费）
 
@@ -67,6 +67,9 @@ docker buildx build \
 | `MAX_MODEL_LEN` | `32768` | vLLM 上下文长度（30min 切片够用） |
 | `MAX_NUM_SEQS` | `8` | vLLM 单 worker batch 上限 |
 | `GPU_MEMORY_UTILIZATION` | `0.9` | vLLM 显存占比 |
+| `MODEL_ID` / `MODEL_NAME` | `microsoft/VibeVoice-ASR` | HF 模型 ID；RunPod Model 字段通常会注入 `MODEL_NAME` |
+| `HF_CACHE_ROOT` | `/runpod-volume/huggingface-cache/hub` | RunPod cached model 根目录 |
+| `MODEL_PATH` | `/tmp/vibevoice-asr-runtime` | 启动时创建的 runtime 模型目录，权重为 symlink，tokenizer 为镜像内 patch |
 | `DEFAULT_CHUNK_MINUTES` | `30` | 切片长度（分钟） |
 | `DEFAULT_CONCURRENCY` | `4` | 单请求内并发切片数 |
 | `VLLM_READY_TIMEOUT_S` | `300` | 等待 vLLM 就绪超时 |
