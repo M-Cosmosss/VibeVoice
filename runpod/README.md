@@ -19,6 +19,8 @@ Layer 4: 生成 tokenizer patch 文件          （随 plugin 变，小层）
 Layer 5: runpod/*.py 业务代码               （日常迭代只改这层）
 ```
 
+`Layer 3` 使用 `pip install --no-deps /app`，所以运行时依赖需要在 `runpod/Dockerfile` 里显式维护。`audio_url` 请求路径依赖 vLLM audio support；镜像构建会 smoke check `librosa` / `soundfile`，避免缺 audio runtime 依赖的问题拖到线上请求才暴露。
+
 日常改 `runpod/handler.py` / `runpod/pipeline.py` 只重建最后一层（~10 KB）。仓库根目录 `.dockerignore` 会排除 docs、demo、tests、训练数据和本地输出，减少 GitHub builder 的 build context。
 
 ## 2. 构建镜像

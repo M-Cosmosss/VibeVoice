@@ -34,6 +34,13 @@ RUN python3 -m pip install --no-cache-dir --no-deps /app \
         librosa==0.11.0 \
         soundfile==0.13.1
 
+# Keep this next to the hand-maintained runtime dependency allowlist above:
+# vLLM only accepts audio_url payloads when its audio extras can import.
+RUN python3 - <<'PY'
+import librosa  # noqa: F401
+import soundfile  # noqa: F401
+PY
+
 # ---- 3. Generate tokenizer files (small layer, no ASR weights baked in) -----
 # Runtime links cached model weights from RunPod's model cache, then overlays
 # these VibeVoice tokenizer files without mutating the cache.
