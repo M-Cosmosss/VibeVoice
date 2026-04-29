@@ -32,7 +32,9 @@ RUN python3 -m pip install --no-cache-dir --no-deps /app \
 # ---- 3. Generate tokenizer files (small layer, no ASR weights baked in) -----
 # Runtime links cached model weights from RunPod's model cache, then overlays
 # these VibeVoice tokenizer files without mutating the cache.
-RUN python3 -m vllm_plugin.tools.generate_tokenizer_files --output ${TOKENIZER_PATCH_DIR}
+# Run as a script (not `-m`) to skip vllm_plugin/__init__.py, which imports
+# vibevoice and would collide with transformers' AutoModel registry on this base image.
+RUN python3 /app/vllm_plugin/tools/generate_tokenizer_files.py --output ${TOKENIZER_PATCH_DIR}
 
 # ---- 4. Runtime entrypoint code (changes most often -> last layer) ----------
 COPY runpod/timing.py /app/runpod_app/timing.py
