@@ -59,6 +59,9 @@ class RunPodPipelineTest(unittest.TestCase):
         payload = module._build_payload("ZmFrZQ==", "audio/mpeg", 1800.0, None)
 
         self.assertEqual(payload["max_tokens"], 18753)
+        prompt = payload["messages"][1]["content"][1]["text"]
+        self.assertIn("Return only a valid JSON array", prompt)
+        self.assertIn("Use numeric seconds", prompt)
 
     def test_payload_clips_output_tokens_to_model_context(self) -> None:
         module = load_pipeline_module()
@@ -81,6 +84,35 @@ class RunPodPipelineTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "engine failed"):
             module._extract_chat_content({"error": {"message": "engine failed"}})
+
+    def test_parse_segments_accepts_common_vibevoice_keys(self) -> None:
+        module = load_pipeline_module()
+
+        segments, parse_ok = module._parse_segments(
+            '[{"Start": 1.25, "End": 3.5, "Speaker": 0, "Content": "hello"}]',
+            offset_s=10.0,
+        )
+
+        self.assertTrue(parse_ok)
+        self.assertEqual(
+            segments,
+            [{"start": 11.25, "end": 13.5, "speaker": "0", "text": "hello"}],
+        )
+
+    def test_parse_segments_accepts_document_wrapped_list(self) -> None:
+        module = load_pipeline_module()
+
+        segments, parse_ok = module._parse_segments(
+            '{"segments":[{"Start time":"00:01.500","End time":"00:02.000",'
+            '"Speaker ID":"1","Content":"ok"}]}',
+            offset_s=20.0,
+        )
+
+        self.assertTrue(parse_ok)
+        self.assertEqual(
+            segments,
+            [{"start": 21.5, "end": 22.0, "speaker": "1", "text": "ok"}],
+        )
 
 
 if __name__ == "__main__":

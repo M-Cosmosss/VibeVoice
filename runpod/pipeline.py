@@ -32,7 +32,9 @@ ASR_AUDIO_TOKEN_COMPRESS_RATIO = 3200
 SHOW_KEYS = ["Start time", "End time", "Speaker ID", "Content"]
 SYSTEM_PROMPT = (
     "You are a helpful assistant that transcribes audio input into text "
-    "output in JSON format."
+    "output in JSON format. Return only a JSON array. Each item must include "
+    '"Start time" and "End time" as seconds from the beginning of the audio, '
+    '"Speaker ID", and "Content". Do not return prose or markdown.'
 )
 
 
@@ -135,16 +137,23 @@ def _extract_chat_content(data: dict[str, Any]) -> str:
 
 def _build_payload(audio_b64: str, mime: str, duration_s: float,
                    hotwords: str | None) -> dict[str, Any]:
+    suffix = (
+        "Return only a valid JSON array. Each segment object must contain "
+        '"Start time", "End time", "Speaker ID", and "Content". '
+        'Use numeric seconds for "Start time" and "End time".'
+    )
     if hotwords and hotwords.strip():
         prompt = (
             f"This is a {duration_s:.2f} seconds audio, with extra info: "
             f"{hotwords.strip()}\n\n"
             f"Please transcribe it with these keys: " + ", ".join(SHOW_KEYS)
+            + "\n" + suffix
         )
     else:
         prompt = (
             f"This is a {duration_s:.2f} seconds audio, please transcribe it "
             f"with these keys: " + ", ".join(SHOW_KEYS)
+            + "\n" + suffix
         )
     data_url = f"data:{mime};base64,{audio_b64}"
     return {
@@ -277,6 +286,14 @@ def _extract_json(text: str) -> Any | None:
     return None
 
 
+def _first_present(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def _parse_segments(content: str, *, offset_s: float) -> tuple[list[dict[str, Any]], bool]:
     """Parse model output into normalized segments, applying global offset."""
     parsed = _extract_json(content)
@@ -295,13 +312,15 @@ def _parse_segments(content: str, *, offset_s: float) -> tuple[list[dict[str, An
         if not isinstance(item, dict):
             continue
         st = _parse_time_to_s(
-            item.get("Start time") or item.get("start") or item.get("start_time")
+            _first_present(item, ("Start time", "Start", "start", "start_time"))
         )
         ed = _parse_time_to_s(
-            item.get("End time") or item.get("end") or item.get("end_time")
+            _first_present(item, ("End time", "End", "end", "end_time"))
         )
-        spk = item.get("Speaker ID") or item.get("speaker") or item.get("speaker_id")
-        text = item.get("Content") or item.get("text") or item.get("content") or ""
+        spk = _first_present(
+            item, ("Speaker ID", "Speaker", "speaker", "speaker_id")
+        )
+        text = _first_present(item, ("Content", "text", "content")) or ""
         seg = {
             "start": (st + offset_s) if st is not None else None,
             "end": (ed + offset_s) if ed is not None else None,
