@@ -9,7 +9,12 @@ entry point defined in pyproject.toml.
 """
 
 from vllm.model_executor.models import ModelRegistry
-from transformers import AutoConfig, AutoTokenizer, Qwen2Tokenizer, AutoProcessor, Qwen2AudioProcessor
+from transformers import AutoConfig, AutoTokenizer, Qwen2Tokenizer, AutoProcessor
+
+try:
+    from transformers import Qwen2AudioProcessor
+except ImportError:
+    Qwen2AudioProcessor = None  # Base image transformers may not ship qwen2_audio
 
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceASRTextTokenizerFast
@@ -50,10 +55,11 @@ def register_vibevoice():
         pass  # May already be registered
 
     # Register the processor with transformers
-    try:
-        AutoProcessor.register(VibeVoiceConfig, processor_class=Qwen2AudioProcessor)
-    except Exception:
-        pass  # May already be registered
+    if Qwen2AudioProcessor is not None:
+        try:
+            AutoProcessor.register(VibeVoiceConfig, processor_class=Qwen2AudioProcessor)
+        except Exception:
+            pass  # May already be registered
 
     # Register the model class with the architecture name "VibeVoice"
     # This name must match the "architectures" list in config.json

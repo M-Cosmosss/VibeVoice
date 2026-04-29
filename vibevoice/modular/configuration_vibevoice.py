@@ -3,10 +3,10 @@
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from transformers.configuration_utils import PretrainedConfig 
+from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers import Qwen2Config
 
 logger = logging.get_logger(__name__)
 
