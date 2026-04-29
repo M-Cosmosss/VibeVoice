@@ -27,6 +27,9 @@ MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "32768"))
 ASR_PROMPT_TOKEN_RESERVE = int(os.environ.get("ASR_PROMPT_TOKEN_RESERVE", "512"))
 ASR_AUDIO_SAMPLE_RATE = 24000
 ASR_AUDIO_TOKEN_COMPRESS_RATIO = 3200
+DOWNLOAD_TIMEOUT_S = float(os.environ.get("DOWNLOAD_TIMEOUT_S", "600"))
+DOWNLOAD_RETRIES = int(os.environ.get("DOWNLOAD_RETRIES", "5"))
+DOWNLOAD_CHUNK_BYTES = int(os.environ.get("DOWNLOAD_CHUNK_BYTES", str(1 << 20)))
 
 
 SHOW_KEYS = ["Start time", "End time", "Speaker ID", "Content"]
@@ -57,17 +60,88 @@ async def download_audio(url: str, dest_dir: Path, *, job_id: str) -> Path:
     """Stream-download audio URL to dest_dir. Filename derived from URL or random."""
     suffix = Path(url.split("?")[0]).suffix or ".bin"
     out = dest_dir / f"input{suffix}"
+    part = out.with_suffix(out.suffix + ".part")
     with timed("download", job_id=job_id, url=_truncate(url, 80)) as rec:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=600.0) as client:
-            async with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                size = 0
-                with out.open("wb") as f:
-                    async for chunk in resp.aiter_bytes(1 << 20):
-                        f.write(chunk)
-                        size += len(chunk)
+        size, attempts = await _download_with_retries(url, part, job_id=job_id)
+        part.replace(out)
         rec["size_mb"] = round(size / (1 << 20), 2)
+        rec["retries"] = max(0, attempts - 1)
     return out
+
+
+async def _download_with_retries(url: str, part: Path, *, job_id: str) -> tuple[int, int]:
+    part.unlink(missing_ok=True)
+    last_error: BaseException | None = None
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=DOWNLOAD_TIMEOUT_S,
+    ) as client:
+        for attempt in range(1, DOWNLOAD_RETRIES + 2):
+            resume_from = part.stat().st_size if part.exists() else 0
+            headers = {"Range": f"bytes={resume_from}-"} if resume_from else None
+            try:
+                async with client.stream("GET", url, headers=headers) as resp:
+                    if resume_from and resp.status_code == 200:
+                        # Server ignored Range; restart cleanly instead of appending
+                        # duplicate bytes.
+                        part.unlink(missing_ok=True)
+                        resume_from = 0
+                    resp.raise_for_status()
+                    mode = "ab" if resume_from and resp.status_code == 206 else "wb"
+                    size = resume_from if mode == "ab" else 0
+                    with part.open(mode) as f:
+                        async for chunk in resp.aiter_bytes(DOWNLOAD_CHUNK_BYTES):
+                            f.write(chunk)
+                            size += len(chunk)
+                return size, attempt
+            except getattr(httpx, "HTTPStatusError", RuntimeError) as e:
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                if status_code not in (429, 500, 502, 503, 504) or attempt > DOWNLOAD_RETRIES:
+                    raise
+                last_error = e
+                wait_s = min(30.0, 2.0 * attempt)
+                emit(
+                    "download_retry",
+                    job_id=job_id,
+                    attempt=attempt,
+                    retries=DOWNLOAD_RETRIES,
+                    downloaded_bytes=part.stat().st_size if part.exists() else 0,
+                    wait_s=wait_s,
+                    status_code=status_code,
+                    error=type(e).__name__,
+                )
+                await asyncio.sleep(wait_s)
+            except _download_retry_errors() as e:
+                last_error = e
+                if attempt > DOWNLOAD_RETRIES:
+                    raise
+                wait_s = min(30.0, 2.0 * attempt)
+                emit(
+                    "download_retry",
+                    job_id=job_id,
+                    attempt=attempt,
+                    retries=DOWNLOAD_RETRIES,
+                    downloaded_bytes=part.stat().st_size if part.exists() else 0,
+                    wait_s=wait_s,
+                    error=type(e).__name__,
+                )
+                await asyncio.sleep(wait_s)
+    raise RuntimeError(f"download failed: {last_error}")
+
+
+def _download_retry_errors() -> tuple[type[BaseException], ...]:
+    errors: list[type[BaseException]] = [OSError]
+    for name in (
+        "RemoteProtocolError",
+        "ReadError",
+        "ReadTimeout",
+        "TimeoutException",
+        "TransportError",
+    ):
+        exc = getattr(httpx, name, None)
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            errors.append(exc)
+    return tuple(errors)
 
 
 def probe_duration_s(path: Path) -> float:

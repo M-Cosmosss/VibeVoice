@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import asyncio
+import tempfile
 import types
 import unittest
 from contextlib import contextmanager
@@ -53,6 +55,66 @@ def load_pipeline_module():
 
 
 class RunPodPipelineTest(unittest.TestCase):
+    def test_download_audio_resumes_after_stream_disconnect(self) -> None:
+        module = load_pipeline_module()
+
+        class RemoteProtocolError(Exception):
+            pass
+
+        class FakeResponse:
+            def __init__(self, status_code: int, chunks: list[bytes], fail_after_first: bool = False):
+                self.status_code = status_code
+                self._chunks = chunks
+                self._fail_after_first = fail_after_first
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self) -> None:
+                return None
+
+            async def aiter_bytes(self, _chunk_size: int):
+                for i, chunk in enumerate(self._chunks):
+                    yield chunk
+                    if self._fail_after_first and i == 0:
+                        raise RemoteProtocolError("peer closed connection")
+
+        class FakeClient:
+            calls: list[dict | None] = []
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def stream(self, _method: str, _url: str, headers=None):
+                self.calls.append(headers)
+                if len(self.calls) == 1:
+                    return FakeResponse(200, [b"abc"], fail_after_first=True)
+                return FakeResponse(206, [b"def"])
+
+        module.httpx = types.SimpleNamespace(
+            AsyncClient=FakeClient,
+            HTTPStatusError=RuntimeError,
+            RemoteProtocolError=RemoteProtocolError,
+        )
+        module.DOWNLOAD_RETRIES = 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = asyncio.run(
+                module.download_audio("https://example.test/audio.m4a", Path(tmp), job_id="job1")
+            )
+
+            self.assertEqual(path.read_bytes(), b"abcdef")
+            self.assertEqual(FakeClient.calls, [None, {"Range": "bytes=3-"}])
+
     def test_payload_uses_remaining_context_for_output_tokens(self) -> None:
         module = load_pipeline_module()
 
