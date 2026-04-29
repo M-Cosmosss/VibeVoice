@@ -141,7 +141,13 @@ FP8 是 vLLM engine 启动期参数，不能作为单次 `/run` / `/runsync` 音
     "configuration": {
       "chunk_count": 2,
       "chunk_duration": {"seconds": 1800.0, "readable": "30m0.000s"},
-      "concurrency": 12
+      "concurrency": 12,
+      "quantization": {
+        "enable_fp8": false,
+        "quantization": "none",
+        "kv_cache_dtype": "auto",
+        "calculate_kv_scales": false
+      }
     },
     "stages": {
       "download_audio": {"seconds": 4.21, "readable": "4.210s"},

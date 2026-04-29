@@ -152,6 +152,8 @@ case "${VLLM_CALCULATE_KV_SCALES,,}" in
         ;;
 esac
 
+export ENABLE_FP8 VLLM_QUANTIZATION VLLM_KV_CACHE_DTYPE VLLM_CALCULATE_KV_SCALES
+
 log "launching vLLM serve on port ${VLLM_PORT} (max_model_len=${MAX_MODEL_LEN}, max_num_seqs=${MAX_NUM_SEQS}, quantization=${VLLM_QUANTIZATION:-none}, kv_cache_dtype=${VLLM_KV_CACHE_DTYPE})"
 VLLM_T0=$(date +%s)
 vllm serve "${VLLM_ARGS[@]}" \

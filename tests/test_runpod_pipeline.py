@@ -211,27 +211,63 @@ class RunPodPipelineTest(unittest.TestCase):
             ),
         ]
 
-        timing = module._build_timing_report(
-            total_s=10.25,
-            audio_duration_s=90.0,
-            chunk_seconds=60,
-            concurrency=2,
-            download_s=1.0,
-            probe_s=0.2,
-            split_s=0.3,
-            asr_wall_s=3.7,
-            merge_s=0.05,
-            results=results,
-        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ENABLE_FP8": "false",
+                "VLLM_QUANTIZATION": "",
+                "VLLM_KV_CACHE_DTYPE": "auto",
+                "VLLM_CALCULATE_KV_SCALES": "false",
+            },
+            clear=False,
+        ):
+            timing = module._build_timing_report(
+                total_s=10.25,
+                audio_duration_s=90.0,
+                chunk_seconds=60,
+                concurrency=2,
+                download_s=1.0,
+                probe_s=0.2,
+                split_s=0.3,
+                asr_wall_s=3.7,
+                merge_s=0.05,
+                results=results,
+            )
 
         self.assertEqual(timing["summary"]["total_elapsed_time"]["readable"], "10.250s")
         self.assertEqual(timing["configuration"]["chunk_duration"]["readable"], "1m0.000s")
+        self.assertEqual(timing["configuration"]["quantization"]["quantization"], "none")
+        self.assertEqual(timing["configuration"]["quantization"]["kv_cache_dtype"], "auto")
         self.assertIn("download_audio", timing["stages"])
         self.assertIn("transcribe_audio_wall_time", timing["stages"])
         self.assertEqual(timing["chunk_summary"]["transcription_slowest_chunk"]["readable"], "3.500s")
         self.assertEqual(timing["chunks"][0]["transcription_time"]["readable"], "3.500s")
         self.assertEqual(timing["chunks"][1]["audio_start"]["readable"], "1m0.000s")
         self.assertFalse(timing["chunks"][1]["parsed_as_json"])
+
+    def test_effective_quantization_config_with_enable_fp8(self):
+        module = load_pipeline_module()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ENABLE_FP8": "true",
+                "VLLM_QUANTIZATION": "",
+                "VLLM_KV_CACHE_DTYPE": "auto",
+                "VLLM_CALCULATE_KV_SCALES": "false",
+            },
+            clear=False,
+        ):
+            config = module._effective_quantization_config()
+
+        self.assertEqual(
+            config,
+            {
+                "enable_fp8": True,
+                "quantization": "fp8",
+                "kv_cache_dtype": "fp8",
+                "calculate_kv_scales": True,
+            },
+        )
 
 
 if __name__ == "__main__":

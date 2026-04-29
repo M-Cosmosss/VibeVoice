@@ -452,6 +452,32 @@ def _duration(seconds: float) -> dict[str, Any]:
     }
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _effective_quantization_config() -> dict[str, Any]:
+    enable_fp8 = _env_truthy("ENABLE_FP8")
+    quantization = os.environ.get("VLLM_QUANTIZATION", "").strip()
+    kv_cache_dtype = os.environ.get("VLLM_KV_CACHE_DTYPE", "auto").strip() or "auto"
+    calculate_kv_scales = _env_truthy("VLLM_CALCULATE_KV_SCALES")
+
+    if enable_fp8:
+        if not quantization:
+            quantization = "fp8"
+        if kv_cache_dtype == "auto":
+            kv_cache_dtype = "fp8"
+        if not calculate_kv_scales:
+            calculate_kv_scales = True
+
+    return {
+        "enable_fp8": enable_fp8,
+        "quantization": quantization or "none",
+        "kv_cache_dtype": kv_cache_dtype,
+        "calculate_kv_scales": calculate_kv_scales,
+    }
+
+
 def _build_timing_report(
     *,
     total_s: float,
@@ -478,6 +504,7 @@ def _build_timing_report(
             "chunk_count": len(results),
             "chunk_duration": _duration(chunk_seconds),
             "concurrency": concurrency,
+            "quantization": _effective_quantization_config(),
         },
         "stages": {
             "download_audio": _duration(download_s),
