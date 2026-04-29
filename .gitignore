@@ -176,3 +176,7 @@ tags
 exp
 .gradio/
 experimental_voices
+runpod/CONTEXT.md
+.claude/settings.local.json
+AGENTS.md
+CLAUDE.md
