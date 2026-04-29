@@ -358,6 +358,92 @@ class JobResult:
     timing: dict[str, Any]
 
 
+def _format_duration(seconds: float) -> str:
+    millis = int(round(max(0.0, seconds) * 1000))
+    total_seconds, ms = divmod(millis, 1000)
+    minutes_total, sec = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes_total, 60)
+    if hours:
+        return f"{hours}h{minutes}m{sec}.{ms:03d}s"
+    if minutes:
+        return f"{minutes}m{sec}.{ms:03d}s"
+    return f"{sec}.{ms:03d}s"
+
+
+def _duration(seconds: float) -> dict[str, Any]:
+    rounded = round(max(0.0, seconds), 3)
+    return {
+        "seconds": rounded,
+        "readable": _format_duration(rounded),
+    }
+
+
+def _build_timing_report(
+    *,
+    total_s: float,
+    audio_duration_s: float,
+    chunk_seconds: int,
+    concurrency: int,
+    download_s: float,
+    probe_s: float,
+    split_s: float,
+    asr_wall_s: float,
+    merge_s: float,
+    results: list[ChunkResult],
+) -> dict[str, Any]:
+    prepare_times = [r.prepare_duration_s for r in results]
+    transcribe_times = [r.asr_duration_s for r in results]
+    return {
+        "summary": {
+            "total_elapsed_time": _duration(total_s),
+            "audio_duration": _duration(audio_duration_s),
+            "realtime_factor": round(total_s / max(audio_duration_s, 1e-6), 4),
+            "gpu": gpu_name(),
+        },
+        "configuration": {
+            "chunk_count": len(results),
+            "chunk_duration": _duration(chunk_seconds),
+            "concurrency": concurrency,
+        },
+        "stages": {
+            "download_audio": _duration(download_s),
+            "probe_audio_duration": _duration(probe_s),
+            "split_audio": _duration(split_s),
+            "transcribe_audio_wall_time": _duration(asr_wall_s),
+            "merge_transcripts": _duration(merge_s),
+        },
+        "chunk_summary": {
+            "request_preparation_total": _duration(sum(prepare_times)),
+            "request_preparation_slowest_chunk": _duration(
+                max(prepare_times, default=0.0)
+            ),
+            "transcription_total_across_chunks": _duration(sum(transcribe_times)),
+            "transcription_slowest_chunk": _duration(
+                max(transcribe_times, default=0.0)
+            ),
+        },
+        "chunks": [
+            {
+                "chunk_index": r.index,
+                "audio_start": _duration(r.start_s),
+                "audio_end": _duration(r.end_s),
+                "audio_duration": _duration(r.duration_s),
+                "request_preparation_time": _duration(r.prepare_duration_s),
+                "transcription_time": _duration(r.asr_duration_s),
+                "processing_time": _duration(
+                    r.prepare_duration_s + r.asr_duration_s
+                ),
+                "realtime_factor": round(
+                    r.asr_duration_s / max(r.duration_s, 1e-6), 4
+                ),
+                "segments": len(r.segments),
+                "parsed_as_json": r.parse_ok,
+            }
+            for r in results
+        ],
+    }
+
+
 async def run_job(audio_url: str, *, hotwords: str | None,
                   chunk_minutes: int, concurrency: int,
                   job_id: str | None = None) -> JobResult:
@@ -400,26 +486,18 @@ async def run_job(audio_url: str, *, hotwords: str | None,
     json_path = TRANSCRIPT_DIR / f"{job_id}.json"
     txt_path = TRANSCRIPT_DIR / f"{job_id}.txt"
     total_s = time.perf_counter() - job_t0
-    timing = {
-        "total_s": round(total_s, 3),
-        "audio_duration_s": round(duration_s, 2),
-        "rtf": round(total_s / max(duration_s, 1e-6), 4),
-        "num_chunks": len(chunks),
-        "chunk_seconds": chunk_seconds,
-        "concurrency": concurrency,
-        "download_s": round(download_s, 3),
-        "probe_s": round(probe_s, 3),
-        "split_s": round(split_s, 3),
-        "merge_s": round(merge_s, 3),
-        "asr_wall_s": round(asr_wall_s, 3),
-        "prepare_per_chunk_s": [round(r.prepare_duration_s, 3) for r in results],
-        "prepare_total_s": round(sum(r.prepare_duration_s for r in results), 3),
-        "prepare_max_s": round(max((r.prepare_duration_s for r in results), default=0.0), 3),
-        "asr_per_chunk_s": [round(r.asr_duration_s, 3) for r in results],
-        "asr_total_s": round(sum(r.asr_duration_s for r in results), 3),
-        "asr_max_s": round(max((r.asr_duration_s for r in results), default=0.0), 3),
-        "gpu": gpu_name(),
-    }
+    timing = _build_timing_report(
+        total_s=total_s,
+        audio_duration_s=duration_s,
+        chunk_seconds=chunk_seconds,
+        concurrency=concurrency,
+        download_s=download_s,
+        probe_s=probe_s,
+        split_s=split_s,
+        asr_wall_s=asr_wall_s,
+        merge_s=merge_s,
+        results=results,
+    )
     payload = {
         "job_id": job_id,
         "audio_url": audio_url,
@@ -431,7 +509,9 @@ async def run_job(audio_url: str, *, hotwords: str | None,
     txt_path.write_text(text)
 
     emit("job_done", job_id=job_id, total_s=total_s,
-         audio_s=duration_s, rtf=timing["rtf"], gpu=gpu_name(),
+         audio_s=duration_s,
+         rtf=timing["summary"]["realtime_factor"],
+         gpu=gpu_name(),
          num_chunks=len(chunks), concurrency=concurrency)
 
     return JobResult(

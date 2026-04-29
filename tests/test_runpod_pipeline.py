@@ -114,6 +114,63 @@ class RunPodPipelineTest(unittest.TestCase):
             [{"start": 21.5, "end": 22.0, "speaker": "1", "text": "ok"}],
         )
 
+    def test_format_duration_is_human_readable(self) -> None:
+        module = load_pipeline_module()
+
+        self.assertEqual(module._format_duration(0.1234), "0.123s")
+        self.assertEqual(module._format_duration(62.003), "1m2.003s")
+        self.assertEqual(module._format_duration(3723.456), "1h2m3.456s")
+
+    def test_timing_report_uses_readable_stage_and_chunk_names(self) -> None:
+        module = load_pipeline_module()
+
+        results = [
+            module.ChunkResult(
+                index=0,
+                start_s=0.0,
+                end_s=60.0,
+                duration_s=60.0,
+                raw_content="[]",
+                segments=[{"text": "one"}],
+                parse_ok=True,
+                prepare_duration_s=0.125,
+                asr_duration_s=3.5,
+            ),
+            module.ChunkResult(
+                index=1,
+                start_s=60.0,
+                end_s=90.0,
+                duration_s=30.0,
+                raw_content="[]",
+                segments=[],
+                parse_ok=False,
+                prepare_duration_s=0.25,
+                asr_duration_s=2.0,
+            ),
+        ]
+
+        timing = module._build_timing_report(
+            total_s=10.25,
+            audio_duration_s=90.0,
+            chunk_seconds=60,
+            concurrency=2,
+            download_s=1.0,
+            probe_s=0.2,
+            split_s=0.3,
+            asr_wall_s=3.7,
+            merge_s=0.05,
+            results=results,
+        )
+
+        self.assertEqual(timing["summary"]["total_elapsed_time"]["readable"], "10.250s")
+        self.assertEqual(timing["configuration"]["chunk_duration"]["readable"], "1m0.000s")
+        self.assertIn("download_audio", timing["stages"])
+        self.assertIn("transcribe_audio_wall_time", timing["stages"])
+        self.assertEqual(timing["chunk_summary"]["transcription_slowest_chunk"]["readable"], "3.500s")
+        self.assertEqual(timing["chunks"][0]["transcription_time"]["readable"], "3.500s")
+        self.assertEqual(timing["chunks"][1]["audio_start"]["readable"], "1m0.000s")
+        self.assertFalse(timing["chunks"][1]["parsed_as_json"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -126,24 +126,44 @@ docker buildx build \
     "txt":  "/tmp/transcripts/abc123.txt"
   },
   "timing": {
-    "total_s": 92.7,
-    "audio_duration_s": 3600.0,
-    "rtf": 0.0258,
-    "num_chunks": 2,
-    "chunk_seconds": 1800,
-    "concurrency": 4,
-    "download_s": 4.21,
-    "probe_s": 0.08,
-    "split_s": 1.10,
-    "merge_s": 0.05,
-    "asr_wall_s": 87.30,
-    "prepare_per_chunk_s": [0.62, 0.64],
-    "prepare_total_s": 1.26,
-    "prepare_max_s": 0.64,
-    "asr_per_chunk_s": [42.13, 45.22],
-    "asr_total_s": 87.35,
-    "asr_max_s": 45.22,
-    "gpu": "NVIDIA L40S"
+    "summary": {
+      "total_elapsed_time": {"seconds": 92.7, "readable": "1m32.700s"},
+      "audio_duration": {"seconds": 3600.0, "readable": "1h0m0.000s"},
+      "realtime_factor": 0.0258,
+      "gpu": "NVIDIA L40S"
+    },
+    "configuration": {
+      "chunk_count": 2,
+      "chunk_duration": {"seconds": 1800.0, "readable": "30m0.000s"},
+      "concurrency": 4
+    },
+    "stages": {
+      "download_audio": {"seconds": 4.21, "readable": "4.210s"},
+      "probe_audio_duration": {"seconds": 0.08, "readable": "0.080s"},
+      "split_audio": {"seconds": 1.1, "readable": "1.100s"},
+      "transcribe_audio_wall_time": {"seconds": 87.3, "readable": "1m27.300s"},
+      "merge_transcripts": {"seconds": 0.05, "readable": "0.050s"}
+    },
+    "chunk_summary": {
+      "request_preparation_total": {"seconds": 1.26, "readable": "1.260s"},
+      "request_preparation_slowest_chunk": {"seconds": 0.64, "readable": "0.640s"},
+      "transcription_total_across_chunks": {"seconds": 87.35, "readable": "1m27.350s"},
+      "transcription_slowest_chunk": {"seconds": 45.22, "readable": "45.220s"}
+    },
+    "chunks": [
+      {
+        "chunk_index": 0,
+        "audio_start": {"seconds": 0.0, "readable": "0.000s"},
+        "audio_end": {"seconds": 1800.0, "readable": "30m0.000s"},
+        "audio_duration": {"seconds": 1800.0, "readable": "30m0.000s"},
+        "request_preparation_time": {"seconds": 0.62, "readable": "0.620s"},
+        "transcription_time": {"seconds": 42.13, "readable": "42.130s"},
+        "processing_time": {"seconds": 42.75, "readable": "42.750s"},
+        "realtime_factor": 0.0234,
+        "segments": 180,
+        "parsed_as_json": true
+      }
+    ]
   }
 }
 ```
@@ -195,11 +215,13 @@ done
 [TIMING] stage=job_done job=abc123 total_s=92.702 audio_s=3600.0 rtf=0.0258 gpu=NVIDIA L40S num_chunks=2 concurrency=4
 ```
 
-切换 GPU 后重点对比 `stage=job_done` 的 `rtf`，以及响应里的 `asr_max_s`、`asr_per_chunk_s`。
+切换 GPU 后重点对比 `stage=job_done` 的 `rtf`，以及响应里的
+`timing.chunk_summary.transcription_slowest_chunk` 和
+`timing.chunks[].transcription_time`。
 
 ## 6. 调参建议
 
-- **真正决定吞吐的是 `asr_max_s`**（并发下最慢那片），不是 `asr_total_s`。
+- **真正决定吞吐的是 `transcription_slowest_chunk`**（并发下最慢那片），不是所有切片转写时间相加。
 - 想降单切片延迟：增大 `MAX_NUM_SEQS`（更高显存占用） / 缩短 `chunk_minutes`（切更多片，并发分担）。
 - 想降总成本：保持 `concurrency` ≤ Max Workers，避免排队。
 - L40S 48 GB 起步：`MAX_MODEL_LEN=32768 MAX_NUM_SEQS=8 chunk_minutes=30 concurrency=4`。
