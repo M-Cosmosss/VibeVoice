@@ -67,6 +67,21 @@ class RunPodPipelineTest(unittest.TestCase):
 
         self.assertEqual(payload["max_tokens"], 5253)
 
+    def test_extract_chat_content_reads_openai_response(self) -> None:
+        module = load_pipeline_module()
+
+        content = module._extract_chat_content({
+            "choices": [{"message": {"content": "[{\"Content\":\"ok\"}]"}}],
+        })
+
+        self.assertEqual(content, "[{\"Content\":\"ok\"}]")
+
+    def test_extract_chat_content_reports_non_chat_response_body(self) -> None:
+        module = load_pipeline_module()
+
+        with self.assertRaisesRegex(RuntimeError, "engine failed"):
+            module._extract_chat_content({"error": {"message": "engine failed"}})
+
 
 if __name__ == "__main__":
     unittest.main()

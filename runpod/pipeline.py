@@ -123,6 +123,16 @@ def _max_tokens_for_duration(duration_s: float) -> int:
     return room
 
 
+def _extract_chat_content(data: dict[str, Any]) -> str:
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        body = _truncate(json.dumps(data, ensure_ascii=False), 1000)
+        raise RuntimeError(
+            f"ASR response missing choices[0].message.content: {body}"
+        ) from e
+
+
 def _build_payload(audio_b64: str, mime: str, duration_s: float,
                    hotwords: str | None) -> dict[str, Any]:
     if hotwords and hotwords.strip():
@@ -177,7 +187,13 @@ async def asr_chunk(client: httpx.AsyncClient, idx: int, start_s: float,
         ) from e
     dt = time.perf_counter() - t0
     data = resp.json()
-    content = data["choices"][0]["message"]["content"]
+    try:
+        content = _extract_chat_content(data)
+    except RuntimeError:
+        body = _truncate(resp.text.replace("\n", "\\n"), 1000)
+        emit("asr_chunk_error", job_id=job_id, chunk=idx,
+             status_code=resp.status_code, response_body=body)
+        raise
 
     segments, parse_ok = _parse_segments(content, offset_s=start_s)
     emit("asr_chunk_done", job_id=job_id, chunk=idx, duration_s=dt,
