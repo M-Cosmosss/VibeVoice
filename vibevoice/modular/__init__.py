@@ -1,14 +1,4 @@
 # vibevoice/modular/__init__.py
-from .modeling_vibevoice_streaming_inference import VibeVoiceStreamingForConditionalGenerationInference
-from .configuration_vibevoice_streaming import VibeVoiceStreamingConfig
-from .modeling_vibevoice_streaming import VibeVoiceStreamingModel, VibeVoiceStreamingPreTrainedModel
-from .streamer import AudioStreamer, AsyncAudioStreamer
-
-__all__ = [
-    "VibeVoiceStreamingForConditionalGenerationInference",
-    "VibeVoiceStreamingConfig",
-    "VibeVoiceStreamingModel",
-    "VibeVoiceStreamingPreTrainedModel",
-    "AudioStreamer",
-    "AsyncAudioStreamer",
-]
+# Intentionally empty: avoid eager-loading streaming inference path
+# (which pulls in diffusers via vibevoice.schedule.dpm_solver).
+# Import submodules explicitly when needed.

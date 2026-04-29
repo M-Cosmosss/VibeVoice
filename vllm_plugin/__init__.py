@@ -28,7 +28,10 @@ def register_vibevoice():
     - VibeVoiceForCausalLM with vLLM ModelRegistry
     """
     # Register the configuration class with transformers
-    AutoConfig.register("vibevoice", VibeVoiceConfig)
+    try:
+        AutoConfig.register("vibevoice", VibeVoiceConfig)
+    except ValueError:
+        pass  # May already be registered by base image
 
     # Register the tokenizer with transformers.
     # IMPORTANT (ASR): Align with the PyTorch ASR path.
@@ -54,8 +57,11 @@ def register_vibevoice():
 
     # Register the model class with the architecture name "VibeVoice"
     # This name must match the "architectures" list in config.json
-    ModelRegistry.register_model("VibeVoice", VibeVoiceForCausalLM)
-    ModelRegistry.register_model("VibeVoiceForASRTraining", VibeVoiceForCausalLM)
+    for arch in ("VibeVoice", "VibeVoiceForASRTraining"):
+        try:
+            ModelRegistry.register_model(arch, VibeVoiceForCausalLM)
+        except (ValueError, KeyError):
+            pass  # May already be registered (base image plugin / re-entry)
 
 
 # Note: This function is called via vllm.general_plugins entry point
