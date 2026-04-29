@@ -27,7 +27,12 @@ COPY README.md /app/README.md
 COPY vibevoice /app/vibevoice
 COPY vllm_plugin /app/vllm_plugin
 RUN python3 -m pip install --no-cache-dir --no-deps /app \
-    && python3 -m pip install --no-cache-dir runpod==1.7.7 httpx==0.27.2 hf-transfer==0.1.8
+    && python3 -m pip install --no-cache-dir \
+        runpod==1.7.7 \
+        httpx==0.27.2 \
+        hf-transfer==0.1.8 \
+        librosa==0.11.0 \
+        soundfile==0.13.1
 
 # ---- 3. Generate tokenizer files (small layer, no ASR weights baked in) -----
 # Runtime links cached model weights from RunPod's model cache, then overlays
