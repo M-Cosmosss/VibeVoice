@@ -66,17 +66,23 @@ docker buildx build \
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MAX_MODEL_LEN` | `32768` | vLLM 上下文长度（30min 切片够用） |
-| `MAX_NUM_SEQS` | `8` | vLLM 单 worker batch 上限 |
+| `MAX_NUM_SEQS` | `200` | vLLM 单 worker scheduler 上限；实际并发由 `concurrency` 控制 |
 | `GPU_MEMORY_UTILIZATION` | `0.9` | vLLM 显存占比 |
+| `ENABLE_FP8` | `false` | 创建 Endpoint/Template 时的量化开关；设为 `true` 会启用 vLLM FP8 权重量化和 FP8 KV cache |
+| `VLLM_QUANTIZATION` | 空 | 细粒度覆盖 vLLM `--quantization`；`ENABLE_FP8=true` 且未设置时为 `fp8` |
+| `VLLM_KV_CACHE_DTYPE` | `auto` | 细粒度覆盖 vLLM `--kv-cache-dtype`；`ENABLE_FP8=true` 且未设置时为 `fp8` |
+| `VLLM_CALCULATE_KV_SCALES` | `false` | 细粒度覆盖 vLLM `--calculate-kv-scales`；`ENABLE_FP8=true` 且未设置时为 `true` |
 | `MODEL_ID` / `MODEL_NAME` | `microsoft/VibeVoice-ASR` | HF 模型 ID；RunPod Model 字段通常会注入 `MODEL_NAME` |
 | `HF_CACHE_ROOT` | `/runpod-volume/huggingface-cache/hub` | RunPod cached model 根目录 |
 | `MODEL_PATH` | `/tmp/vibevoice-asr-runtime` | 启动时创建的 runtime 模型目录，权重为 symlink，tokenizer 为镜像内 patch |
 | `DEFAULT_CHUNK_MINUTES` | `30` | 切片长度（分钟） |
-| `DEFAULT_CONCURRENCY` | `4` | 单请求内并发切片数 |
+| `DEFAULT_CONCURRENCY` | `12` | 单请求内并发切片数 |
 | `ASR_PROMPT_TOKEN_RESERVE` | `512` | 为 system/user prompt 预留的输入 token 预算；输出 token 自动使用 `MAX_MODEL_LEN` 剩余空间 |
 | `VLLM_READY_TIMEOUT_S` | `300` | 等待 vLLM 就绪超时 |
 | `ASR_REQUEST_TIMEOUT_S` | `1800` | 单切片 ASR HTTP 超时 |
 | `TRANSCRIPT_DIR` | `/tmp/transcripts` | 文稿落盘目录 |
+
+FP8 是 vLLM engine 启动期参数，不能作为单次 `/run` / `/runsync` 音频任务输入动态切换。要测试 FP8，请在创建或更新 RunPod Endpoint/Template 时添加环境变量 `ENABLE_FP8=true`，让 worker 冷启动时用 FP8 模式加载模型。
 
 ## 4. 调用
 
@@ -87,7 +93,7 @@ docker buildx build \
 | `POST /v2/<EID>/runsync` | 估算总耗时 < ~280s 的请求（≤ 4h 音频在 L40S 上够用） | 默认 **300s** |
 | `POST /v2/<EID>/run` + 轮询 `/status/{id}` | 长音频或不确定时长 | worker execution timeout，可配几小时 |
 
-按 L40S + concurrency=4 估算：
+按 L40S + concurrency=12 估算：
 
 | 音频时长 | 切片数 | 预估总耗时 | 推荐 |
 |---|---|---|---|
@@ -106,7 +112,7 @@ docker buildx build \
     "audio_url": "https://example.com/podcast.mp3",
     "hotwords": ["VibeVoice", "微软"],
     "chunk_minutes": 30,
-    "concurrency": 4,
+    "concurrency": 12,
     "job_id": "optional-custom-id"
   }
 }
@@ -135,7 +141,7 @@ docker buildx build \
     "configuration": {
       "chunk_count": 2,
       "chunk_duration": {"seconds": 1800.0, "readable": "30m0.000s"},
-      "concurrency": 4
+      "concurrency": 12
     },
     "stages": {
       "download_audio": {"seconds": 4.21, "readable": "4.210s"},
@@ -176,7 +182,7 @@ docker buildx build \
 curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
   -H "Authorization: Bearer $RUNPOD_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"input": {"audio_url": "https://.../foo.mp3", "concurrency": 4}}'
+  -d '{"input": {"audio_url": "https://.../foo.mp3", "concurrency": 12}}'
 ```
 
 ### 4.5 异步调用示例
@@ -202,7 +208,7 @@ done
 
 ```
 [TIMING] stage=vllm_ready duration_s=18
-[TIMING] stage=job_start job=abc123 chunk_minutes=30 concurrency=4 gpu=NVIDIA L40S
+[TIMING] stage=job_start job=abc123 chunk_minutes=30 concurrency=12 gpu=NVIDIA L40S
 [TIMING] stage=download job=abc123 url=https://... duration_s=4.210 size_mb=58.30
 [TIMING] stage=probe job=abc123 duration_s=0.082 audio_duration_s=3600.00
 [TIMING] stage=split job=abc123 duration_s=1.103 num_chunks=2 chunk_seconds=1800
@@ -210,9 +216,9 @@ done
 [TIMING] stage=asr_chunk_start job=abc123 chunk=1 start=1800 end=3600
 [TIMING] stage=asr_chunk_done job=abc123 chunk=0 duration_s=42.131 prepare_s=0.620 chunk_audio_s=1800.0 rtf=0.023 segments=180 parse_ok=1
 [TIMING] stage=asr_chunk_done job=abc123 chunk=1 duration_s=45.221 prepare_s=0.640 chunk_audio_s=1800.0 rtf=0.025 segments=192 parse_ok=1
-[TIMING] stage=asr_total job=abc123 duration_s=87.302 concurrency=4 num_chunks=2
+[TIMING] stage=asr_total job=abc123 duration_s=87.302 concurrency=12 num_chunks=2
 [TIMING] stage=merge job=abc123 duration_s=0.054 segments=372 chars=12453
-[TIMING] stage=job_done job=abc123 total_s=92.702 audio_s=3600.0 rtf=0.0258 gpu=NVIDIA L40S num_chunks=2 concurrency=4
+[TIMING] stage=job_done job=abc123 total_s=92.702 audio_s=3600.0 rtf=0.0258 gpu=NVIDIA L40S num_chunks=2 concurrency=12
 ```
 
 切换 GPU 后重点对比 `stage=job_done` 的 `rtf`，以及响应里的
@@ -222,6 +228,6 @@ done
 ## 6. 调参建议
 
 - **真正决定吞吐的是 `transcription_slowest_chunk`**（并发下最慢那片），不是所有切片转写时间相加。
-- 想降单切片延迟：增大 `MAX_NUM_SEQS`（更高显存占用） / 缩短 `chunk_minutes`（切更多片，并发分担）。
+- 想降单切片延迟：提高业务 `concurrency`；`MAX_NUM_SEQS` 默认给足上限，通常不用改。
 - 想降总成本：保持 `concurrency` ≤ Max Workers，避免排队。
-- L40S 48 GB 起步：`MAX_MODEL_LEN=32768 MAX_NUM_SEQS=8 chunk_minutes=30 concurrency=4`。
+- L40S 48 GB 起步：`MAX_MODEL_LEN=32768 MAX_NUM_SEQS=200 chunk_minutes=30 concurrency=12`。

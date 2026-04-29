@@ -13,9 +13,13 @@ log() { echo "[start] $*"; }
 : "${VLLM_PORT:=8000}"
 : "${TRANSCRIPT_DIR:=/tmp/transcripts}"
 : "${MAX_MODEL_LEN:=32768}"
-: "${MAX_NUM_SEQS:=8}"
+: "${MAX_NUM_SEQS:=200}"
 : "${GPU_MEMORY_UTILIZATION:=0.9}"
 : "${VLLM_READY_TIMEOUT_S:=300}"
+: "${ENABLE_FP8:=false}"
+: "${VLLM_QUANTIZATION:=}"
+: "${VLLM_KV_CACHE_DTYPE:=auto}"
+: "${VLLM_CALCULATE_KV_SCALES:=false}"
 
 mkdir -p "$TRANSCRIPT_DIR"
 
@@ -106,21 +110,51 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 log "MODEL_PATH=$MODEL_PATH (RunPod cached model + tokenizer overlay)"
 
-log "launching vLLM serve on port ${VLLM_PORT} (max_model_len=${MAX_MODEL_LEN}, max_num_seqs=${MAX_NUM_SEQS})"
+case "${ENABLE_FP8,,}" in
+    1|true|yes|on)
+        if [[ -z "$VLLM_QUANTIZATION" ]]; then
+            VLLM_QUANTIZATION=fp8
+        fi
+        if [[ "$VLLM_KV_CACHE_DTYPE" == "auto" ]]; then
+            VLLM_KV_CACHE_DTYPE=fp8
+        fi
+        if [[ "$VLLM_CALCULATE_KV_SCALES" == "false" ]]; then
+            VLLM_CALCULATE_KV_SCALES=true
+        fi
+        ;;
+esac
+
+VLLM_ARGS=(
+    "$MODEL_PATH"
+    --served-model-name vibevoice
+    --trust-remote-code
+    --dtype bfloat16
+    --max-num-seqs "$MAX_NUM_SEQS"
+    --max-model-len "$MAX_MODEL_LEN"
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    --no-enable-prefix-caching
+    --enable-chunked-prefill
+    --chat-template-content-format openai
+    --tensor-parallel-size 1
+    --data-parallel-size 1
+    --port "$VLLM_PORT"
+)
+
+if [[ -n "$VLLM_QUANTIZATION" && "$VLLM_QUANTIZATION" != "none" ]]; then
+    VLLM_ARGS+=(--quantization "$VLLM_QUANTIZATION")
+fi
+if [[ "$VLLM_KV_CACHE_DTYPE" != "auto" ]]; then
+    VLLM_ARGS+=(--kv-cache-dtype "$VLLM_KV_CACHE_DTYPE")
+fi
+case "${VLLM_CALCULATE_KV_SCALES,,}" in
+    1|true|yes|on)
+        VLLM_ARGS+=(--calculate-kv-scales)
+        ;;
+esac
+
+log "launching vLLM serve on port ${VLLM_PORT} (max_model_len=${MAX_MODEL_LEN}, max_num_seqs=${MAX_NUM_SEQS}, quantization=${VLLM_QUANTIZATION:-none}, kv_cache_dtype=${VLLM_KV_CACHE_DTYPE})"
 VLLM_T0=$(date +%s)
-vllm serve "$MODEL_PATH" \
-    --served-model-name vibevoice \
-    --trust-remote-code \
-    --dtype bfloat16 \
-    --max-num-seqs "$MAX_NUM_SEQS" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-    --no-enable-prefix-caching \
-    --enable-chunked-prefill \
-    --chat-template-content-format openai \
-    --tensor-parallel-size 1 \
-    --data-parallel-size 1 \
-    --port "$VLLM_PORT" \
+vllm serve "${VLLM_ARGS[@]}" \
     > /tmp/vllm.log 2>&1 &
 VLLM_PID=$!
 log "vLLM pid=$VLLM_PID"

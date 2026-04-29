@@ -18,7 +18,7 @@ from runpod_app.timing import emit
 
 
 DEFAULT_CHUNK_MINUTES = int(os.environ.get("DEFAULT_CHUNK_MINUTES", "30"))
-DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_CONCURRENCY", "4"))
+DEFAULT_CONCURRENCY = int(os.environ.get("DEFAULT_CONCURRENCY", "12"))
 
 
 def _normalize_hotwords(v: Any) -> str | None:
